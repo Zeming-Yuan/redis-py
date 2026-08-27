@@ -15,15 +15,18 @@ the logging change relies on:
 
 import logging
 import threading
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 import redis.asyncio as redis_async
 from redis import Redis
+from redis._parsers import _RESP3Parser
+from redis._parsers.socket import SocketBuffer
 from redis.asyncio.connection import Connection as AsyncConnection
 from redis.backoff import NoBackoff
 from redis.connection import CacheProxyConnection, Connection, ConnectionPool
+from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 from redis.retry import Retry
 
@@ -177,3 +180,188 @@ class TestHostErrorRegression:
         conn = _sync_conn()
         proxy = CacheProxyConnection(conn, MagicMock(), threading.RLock())
         assert proxy._host_error() == "myhost.example.com:6379"
+
+
+class _FailingWriteSock(FakeSock):
+    """A FakeSock whose sendall() fails the way a dropped peer would."""
+
+    def sendall(self, data):
+        raise OSError(32, "Broken pipe")
+
+
+class _RetimeableSock(FakeSock):
+    """A FakeSock whose timeout can actually be armed and read back."""
+
+    def __init__(self, timeout):
+        super().__init__()
+        self._timeout = timeout
+
+    def gettimeout(self):
+        return self._timeout
+
+    def settimeout(self, value):
+        self._timeout = value
+
+
+class TestFailureDetailsSurviveTheFailurePath:
+    """The failure path closes the socket, so the details must be rendered first.
+
+    Before this, `extract_connection_details()` ran only after `disconnect()`
+    had already cleared the socket, so every timed out or failed command was
+    reported as `details: not connected` - losing the resolved ip, local port
+    and the timeout the read actually ran under.
+    """
+
+    def test_sync_read_failure_logs_live_socket_state(self, caplog):
+        conn = _sync_conn()
+        conn._parser = MagicMock()
+        conn._parser.read_response.side_effect = RedisTimeoutError(
+            "Timeout reading from socket"
+        )
+
+        with caplog.at_level(logging.DEBUG, logger="redis.connection"):
+            with pytest.raises(RedisTimeoutError):
+                conn.read_response()
+
+        # the failure path still tears the socket down ...
+        assert conn._sock is None
+        # ... but the details were captured while it was alive.
+        messages = [record.getMessage() for record in caplog.records]
+        assert any(f"local socket port: {LOCAL_PORT}" in m for m in messages)
+        assert any(f"connected to ip {PEER_IP}" in m for m in messages)
+        assert not any("not connected" in m for m in messages)
+
+    def test_sync_write_failure_logs_live_socket_state(self, caplog):
+        conn = _sync_conn()
+        conn._parser = MagicMock()
+        conn._sock = _FailingWriteSock()
+
+        with caplog.at_level(logging.DEBUG, logger="redis.connection"):
+            with pytest.raises(RedisConnectionError):
+                conn.send_packed_command([b"PING\r\n"], check_health=False)
+
+        messages = [record.getMessage() for record in caplog.records]
+        assert any(f"local socket port: {LOCAL_PORT}" in m for m in messages)
+        assert not any("not connected" in m for m in messages)
+
+    @pytest.mark.asyncio
+    async def test_async_read_failure_logs_live_transport_state(self, caplog):
+        conn = _async_conn()
+        # is_connected() needs both halves, otherwise disconnect() returns early
+        # and would leave the writer in place regardless of ordering.
+        conn._reader = MagicMock()
+
+        with (
+            caplog.at_level(logging.DEBUG, logger="redis.asyncio.connection"),
+            patch.object(
+                conn,
+                "_read_response_from_parser",
+                new=AsyncMock(side_effect=OSError("boom")),
+            ),
+        ):
+            with pytest.raises(RedisConnectionError):
+                await conn.read_response()
+
+        assert conn._writer is None
+        messages = [record.getMessage() for record in caplog.records]
+        assert any(f"local socket port: {LOCAL_PORT}" in m for m in messages)
+        assert not any("not connected" in m for m in messages)
+
+    def test_read_failure_renders_nothing_when_debug_disabled(self, caplog):
+        """This is the per-command path; the details must not even be built."""
+        conn = _sync_conn()
+        conn._parser = MagicMock()
+        conn._parser.read_response.side_effect = RedisTimeoutError("boom")
+
+        with (
+            caplog.at_level(logging.INFO, logger="redis.connection"),
+            patch.object(
+                Connection,
+                "extract_connection_details",
+                side_effect=AssertionError("rendered while DEBUG was off"),
+            ),
+        ):
+            with pytest.raises(RedisTimeoutError):
+                conn.read_response()
+
+        assert caplog.records == []
+
+
+class TestParserTimeoutIsReraisedWithTheHost:
+    """The parsers raise redis TimeoutError, which is not an OSError.
+
+    It therefore missed both typed branches in `read_response` and fell through
+    to `except BaseException`, keeping the parser's undecorated
+    "Timeout reading from socket". Async already reported the host, because its
+    deadline surfaces as asyncio.TimeoutError.
+    """
+
+    def test_sync_timeout_message_carries_the_host(self):
+        conn = _sync_conn()
+        conn._parser = MagicMock()
+        conn._parser.read_response.side_effect = RedisTimeoutError(
+            "Timeout reading from socket"
+        )
+
+        with pytest.raises(RedisTimeoutError, match="myhost.example.com:6379"):
+            conn.read_response()
+
+    def test_sync_timeout_still_disconnects(self):
+        conn = _sync_conn()
+        conn._parser = MagicMock()
+        conn._parser.read_response.side_effect = RedisTimeoutError("boom")
+
+        with pytest.raises(RedisTimeoutError):
+            conn.read_response()
+        assert conn._sock is None
+
+    def test_sync_timeout_does_not_disconnect_when_opted_out(self):
+        conn = _sync_conn()
+        conn._parser = MagicMock()
+        conn._parser.read_response.side_effect = RedisTimeoutError("boom")
+
+        with pytest.raises(RedisTimeoutError):
+            conn.read_response(disconnect_on_error=False)
+        assert conn._sock is not None
+
+
+class TestRelaxedTimeoutStaysConsistent:
+    """The parser caches the timeout to restore after a per-call override.
+
+    Updating it while the socket update was skipped left the restored timeout
+    disagreeing with the one actually armed on the socket.
+    """
+
+    def test_parser_is_not_updated_while_socket_is_non_blocking(self):
+        conn = _sync_conn()
+        conn._sock = _RetimeableSock(0)
+
+        with patch.object(Connection, "update_parser_timeout") as update_parser:
+            conn.update_current_socket_timeout(30)
+
+        # a 0 timeout means a can_read() probe is in progress - leave it alone
+        assert conn._sock.gettimeout() == 0
+        update_parser.assert_not_called()
+
+    def test_parser_follows_the_socket_when_blocking(self):
+        conn = _sync_conn()
+        conn._sock = _RetimeableSock(1)
+
+        with patch.object(Connection, "update_parser_timeout") as update_parser:
+            conn.update_current_socket_timeout(30)
+
+        assert conn._sock.gettimeout() == 30
+        update_parser.assert_called_once_with(30)
+
+    def test_resp3_parser_receives_a_none_timeout(self):
+        """None means "block indefinitely"; the RESP3 branch used to drop it."""
+        conn = _sync_conn()
+        conn._sock = _RetimeableSock(1)
+        parser = _RESP3Parser(socket_read_size=8192)
+        parser._buffer = SocketBuffer(conn._sock, 8192, 1)
+        conn._parser = parser
+
+        conn.update_current_socket_timeout(None)
+
+        assert conn._sock.gettimeout() is None
+        assert parser._buffer.socket_timeout is None

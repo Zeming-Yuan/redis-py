@@ -134,6 +134,30 @@ else:
 logger = logging.getLogger(__name__)
 
 
+def add_debug_log_for_connection_failure(
+    connection: "AbstractConnection",
+    error: BaseException,
+    operation: str,
+) -> None:
+    """
+    Render the connection's live state on a failure that is about to close it.
+
+    Must be called *before* ``disconnect()``. ``extract_connection_details()``
+    reads the local port and the in-flight read deadline off the transport, so
+    once it is gone it can only report ``not connected`` - which hides exactly
+    the state needed to explain the failure. In particular it is what tells
+    apart a read that ran under the original timeout from one that ran under a
+    relaxed maintenance timeout.
+    """
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            f"{type(error).__name__} while {operation}, "
+            f"with connection: {connection}, "
+            f"details: {connection.extract_connection_details()}, "
+            f"error: {error}",
+        )
+
+
 class ConnectCallbackProtocol(Protocol):
     def __call__(self, connection: "AbstractConnection"): ...
 
@@ -1249,10 +1273,12 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
             else:
                 self._writer.writelines(command)
                 await self._writer.drain()
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as e:
+            add_debug_log_for_connection_failure(self, e, "writing command")
             await self.disconnect(nowait=True)
             raise TimeoutError("Timeout writing to socket") from None
         except OSError as e:
+            add_debug_log_for_connection_failure(self, e, "writing command")
             await self.disconnect(nowait=True)
             if len(e.args) == 1:
                 err_no, errmsg = "UNKNOWN", e.args[0]
@@ -1262,11 +1288,12 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
             raise ConnectionError(
                 f"Error {err_no} while writing to socket. {errmsg}."
             ) from e
-        except BaseException:
+        except BaseException as e:
             # BaseExceptions can be raised when a socket send operation is not
             # finished, e.g. due to a timeout.  Ideally, a caller could then re-try
             # to send un-sent data. However, the send_packed_command() API
             # does not support it so there is no point in keeping the connection open.
+            add_debug_log_for_connection_failure(self, e, "writing command")
             await self.disconnect(nowait=True)
             raise
 
@@ -1361,23 +1388,26 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
                     disable_decoding=disable_decoding,
                     push_request=push_request,
                 )
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as e:
             if timeout is not None:
                 # user requested timeout, return None. Operation can be retried
                 return None
             # it was a self.socket_timeout error.
             if disconnect_on_error:
+                add_debug_log_for_connection_failure(self, e, "reading response")
                 await self.disconnect(nowait=True)
             raise TimeoutError(f"Timeout reading from {host_error}")
         except OSError as e:
             if disconnect_on_error:
+                add_debug_log_for_connection_failure(self, e, "reading response")
                 await self.disconnect(nowait=True)
             raise ConnectionError(f"Error while reading from {host_error} : {e.args}")
-        except BaseException:
+        except BaseException as e:
             # Also by default close in case of BaseException.  A lot of code
             # relies on this behaviour when doing Command/Response pairs.
             # See #1128.
             if disconnect_on_error:
+                add_debug_log_for_connection_failure(self, e, "reading response")
                 await self.disconnect(nowait=True)
             raise
 
